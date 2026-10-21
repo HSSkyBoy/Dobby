@@ -49,6 +49,39 @@ const int kMmapFd = -1;
 
 const int kMmapFdOffset = 0;
 
+#if defined(__ANDROID__)
+#ifndef __NR_memfd_create
+#if defined(__aarch64__)
+#define __NR_memfd_create 279
+#elif defined(__arm__)
+#define __NR_memfd_create 385
+#elif defined(__x86_64__)
+#define __NR_memfd_create 319
+#elif defined(__i386__)
+#define __NR_memfd_create 356
+#endif
+#endif
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+static int CreateCodeCaveBackingFd(size_t size) {
+#ifdef __NR_memfd_create
+  long fd = syscall(__NR_memfd_create, "jit-cache", MFD_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  if (ftruncate((int)fd, (off_t)size) != 0) {
+    close((int)fd);
+    return -1;
+  }
+  return (int)fd;
+#else
+  (void)size;
+  return -1;
+#endif
+}
+#endif // __ANDROID__
+
 // ================================================================
 // base :: Thread
 
@@ -134,11 +167,28 @@ void *OSMemory::Allocate(size_t size, MemoryPermission access) {
 void *OSMemory::Allocate(size_t size, MemoryPermission access, void *fixed_address) {
   int prot = GetProtectionFromMemoryPermission(access);
 
-  int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-  if (fixed_address != nullptr) {
-    flags = flags | MAP_FIXED;
+  int base_flags = (fixed_address != nullptr) ? MAP_FIXED : 0;
+
+#if defined(__ANDROID__)
+  // Prefer a memfd backing so the region carries a pathname (see
+  // CreateCodeCaveBackingFd). MAP_SHARED keeps the executable pages tied to the
+  // memfd rather than becoming COW anonymous copies on first write, so the
+  // mapping keeps its name across the RW->RX permission flip Dobby does later.
+  // Best-effort only: if the kernel/SELinux rejects an executable file-backed
+  // mapping (some ROMs allow anonymous execmem but not memfd exec), fall back to
+  // the original anonymous mapping so we are never worse than before.
+  int backing_fd = CreateCodeCaveBackingFd(size);
+  if (backing_fd >= 0) {
+    void *result =
+        mmap(fixed_address, size, prot, base_flags | MAP_SHARED, backing_fd, 0);
+    close(backing_fd);  // the mapping holds its own reference
+    if (result != MAP_FAILED)
+      return result;
   }
-  void *result = mmap(fixed_address, size, prot, flags, kMmapFd, kMmapFdOffset);
+#endif
+
+  void *result =
+      mmap(fixed_address, size, prot, base_flags | MAP_PRIVATE | MAP_ANONYMOUS, kMmapFd, kMmapFdOffset);
   if (result == MAP_FAILED)
     return nullptr;
 
